@@ -1,12 +1,289 @@
-﻿const Version = '2026-09-22 20:01:17';
-let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
-let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
+const Version = '2026-09-22 20:01:17';
+// DEBUG is a deployment-level Worker binding, not request input; its value is identical for requests in this isolate.
+let 调试日志打印 = false;
+const 默认SOCKS5白名单 = Object.freeze(['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com']);
+const 默认请求连接设置 = Object.freeze({
+	TCP并发拨号数: 2,
+	反代并发拨号数: 1,
+	预加载竞速拨号: false,
+	SOCKS5白名单: 默认SOCKS5白名单,
+});
+const 请求连接设置 = new WeakMap();
 const Pages静态页面 = 'https://edt-pages.github.io';
+
+function 规范化并发拨号数(value, fallback) {
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed) || parsed === 0) return fallback;
+	return Math.min(16, Math.max(1, Math.floor(parsed)));
+}
+
+function 匹配白名单域名(host, whitelist) {
+	const normalizedHost = String(host ?? '').trim();
+	if (!normalizedHost || !Array.isArray(whitelist)) return false;
+	return whitelist.some(pattern => {
+		const normalizedPattern = String(pattern ?? '').trim();
+		if (!normalizedPattern) return false;
+		const escapedPattern = normalizedPattern
+			.split('*')
+			.map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+			.join('.*');
+		try { return new RegExp(`^${escapedPattern}$`, 'i').test(normalizedHost); }
+		catch (_) { return false; }
+	});
+}
+
+async function 创建请求连接设置(env, request) {
+	let TCP并发数 = 规范化并发拨号数(env?.TCP_CONCURRENT_DIAL, 2);
+	const 反代并发数 = 规范化并发拨号数(env?.PROXY_CONCURRENT_DIAL, 1);
+	if (!env?.TCP_CONCURRENT_DIAL && TCP并发数 !== 1 && 识别运营商(request) === 'cmcc') TCP并发数 = 1;
+	const 自定义白名单 = env?.GO2SOCKS5 && String(env.GO2SOCKS5).trim()
+		? await 整理成数组(String(env.GO2SOCKS5))
+		: [];
+	const SOCKS5白名单 = [...new Set([
+		...默认SOCKS5白名单,
+		...自定义白名单.map(value => String(value).trim()).filter(Boolean),
+	])];
+	return {
+		TCP并发拨号数: TCP并发数,
+		反代并发拨号数: 反代并发数,
+		预加载竞速拨号: ['1', 'true'].includes(String(env?.PRELOAD_RACE_DIAL || '').toLowerCase()),
+		SOCKS5白名单,
+	};
+}
+
+async function 读取外部响应体(response, maxBytes = 1024 * 1024) {
+	const contentLength = Number(response.headers.get('content-length'));
+	if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+		try { await response.body?.cancel(); } catch (_) { }
+		throw new Error('External response exceeds the configured size limit');
+	}
+	if (!response.body) return new Uint8Array(0);
+	const reader = response.body.getReader();
+	const chunks = [];
+	let totalBytes = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			totalBytes += value.byteLength;
+			if (totalBytes > maxBytes) {
+				try { await reader.cancel(); } catch (_) { }
+				throw new Error('External response exceeds the configured size limit');
+			}
+			chunks.push(value);
+		}
+	} finally {
+		try { reader.releaseLock(); } catch (_) { }
+	}
+	const body = new Uint8Array(totalBytes);
+	let offset = 0;
+	for (const chunk of chunks) {
+		body.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return body;
+}
+
+async function 获取外部响应内容(input, init = {}, timeoutMs = 5000, maxBytes = 1024 * 1024) {
+	const controller = new AbortController();
+	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const response = await fetch(input, { ...init, signal: controller.signal });
+		const body = await 读取外部响应体(response, maxBytes);
+		return { response, body };
+	} finally {
+		clearTimeout(timeoutId);
+	}
+}
+async function 获取外部JSON(input, init = {}, timeoutMs = 8000, maxBytes = 1024 * 1024) {
+	const { response, body } = await 获取外部响应内容(input, init, timeoutMs, maxBytes);
+	if (!response.ok) return { response, data: null };
+	return { response, data: JSON.parse(new TextDecoder().decode(body)) };
+}
+
+function 分割受限文本行(text, maxLines = 4096) {
+	if (typeof text !== 'string' || !Number.isInteger(maxLines) || maxLines <= 0) return [];
+	const lines = [];
+	let start = 0, scannedLines = 0;
+	while (start <= text.length && scannedLines < maxLines) {
+		const newline = text.indexOf('\n', start);
+		const end = newline === -1 ? text.length : newline;
+		const line = text.slice(start, end).trim();
+		if (line) lines.push(line);
+		scannedLines++;
+		if (newline === -1) break;
+		start = newline + 1;
+	}
+	return lines;
+}
+
+function 解码Base64文本(base64Text) {
+	const binary = atob(base64Text);
+	const bytes = new Uint8Array(binary.length);
+	for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+	return new TextDecoder('utf-8').decode(bytes);
+}
+
+function 解码外部文本(response, body) {
+	const charset = (response?.headers?.get('content-type') || '').match(/charset=([^\s;]+)/i)?.[1];
+	if (charset) {
+		try { return new TextDecoder(charset.replace(/^['"]|['"]$/g, '')).decode(body); } catch (_) { }
+	}
+	return new TextDecoder().decode(body);
+}
+
+function 规范化Cloudflare用量(value) {
+	const fallback = { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return fallback;
+	const asCount = (entry, defaultValue = 0) => {
+		if (typeof entry !== 'number' && !(typeof entry === 'string' && entry.trim() !== '')) return defaultValue;
+		const numeric = Number(entry);
+		return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : defaultValue;
+	};
+	const pages = asCount(value.pages);
+	const workers = asCount(value.workers);
+	const combinedTotal = pages + workers;
+	const fallbackTotal = Number.isSafeInteger(combinedTotal) ? combinedTotal : 0;
+	return {
+		success: value.success === true,
+		pages,
+		workers,
+		total: asCount(value.total, fallbackTotal),
+		max: asCount(value.max, 100000) || 100000,
+	};
+}
+
+async function 获取管理页面(path, statusOverride = null) {
+	let target;
+	try {
+		target = new URL(path, Pages静态页面);
+		const { response, body } = await 获取外部响应内容(target, { headers: { Accept: 'text/html' } }, 10000, 2 * 1024 * 1024);
+		if (!response.ok || !/text\/html/i.test(response.headers.get('content-type') || '')) throw new Error('Admin page source is unavailable');
+		return new Response(body, {
+			status: statusOverride ?? response.status,
+			headers: {
+				'Content-Type': response.headers.get('content-type') || 'text/html; charset=utf-8',
+				'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+				'Pragma': 'no-cache',
+				'Expires': '0',
+				'X-Content-Type-Options': 'nosniff',
+			},
+		});
+	} catch (error) {
+		console.warn('[Admin Pages] static page unavailable', target?.pathname || '/unknown', error?.name || 'Error');
+		return new Response('Admin interface temporarily unavailable. Please retry later.', {
+			status: 503,
+			headers: {
+				'Content-Type': 'text/plain; charset=utf-8',
+				'Cache-Control': 'no-store',
+				'Retry-After': '60',
+				'X-Content-Type-Options': 'nosniff',
+			},
+		});
+	}
+}
+
+function 复制配置值(value, depth = 0) {
+	if (depth > 64) return null;
+	if (Array.isArray(value)) return value.map(entry => 复制配置值(entry, depth + 1));
+	if (value && typeof value === 'object') {
+		const copy = {};
+		for (const [key, entry] of Object.entries(value)) {
+			if (key !== '__proto__' && key !== 'prototype' && key !== 'constructor') copy[key] = 复制配置值(entry, depth + 1);
+		}
+		return copy;
+	}
+	return value;
+}
+
+function 合并配置默认值(defaults, stored) {
+	if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) return 复制配置值(defaults);
+	if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return 复制配置值(defaults);
+	const merged = 复制配置值(defaults);
+	for (const [key, value] of Object.entries(stored)) {
+		if (key === '__proto__' || key === 'prototype' || key === 'constructor') continue;
+		if (!Object.prototype.hasOwnProperty.call(defaults, key)) {
+			merged[key] = 复制配置值(value);
+			continue;
+		}
+		const defaultValue = defaults[key];
+		if (defaultValue && typeof defaultValue === 'object' && !Array.isArray(defaultValue)) {
+			merged[key] = 合并配置默认值(defaultValue, value);
+		} else if (Array.isArray(defaultValue)) {
+			merged[key] = Array.isArray(value) ? 复制配置值(value) : 复制配置值(defaultValue);
+		} else if (defaultValue === null) {
+			merged[key] = value === null || typeof value === 'string' ? value : null;
+		} else if (typeof defaultValue === 'number') {
+			const numeric = typeof value === 'number' || (typeof value === 'string' && value.trim() !== '') ? Number(value) : NaN;
+			merged[key] = Number.isFinite(numeric) ? numeric : defaultValue;
+		} else {
+			merged[key] = typeof value === typeof defaultValue ? value : defaultValue;
+		}
+	}
+	return merged;
+}
+
+function 隐去日志URL(urlText, env = {}) {
+	try {
+		const url = new URL(urlText);
+		let pathname = url.pathname;
+		const knownPaths = new Set(['/', '/admin', '/login', '/logout', '/sub', '/version', '/locations', '/robots.txt']);
+		const normalizedPath = pathname.toLowerCase();
+		const keyPath = typeof env?.KEY === 'string' && env.KEY ? `/${env.KEY}`.toLowerCase() : '';
+		if ((keyPath && normalizedPath === keyPath) || /^\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(pathname)) pathname = '/[redacted]';
+		else if (/^\/video(?:\/|$)/i.test(pathname)) pathname = '/video/[redacted]';
+		else if (/^\/admin(?:\/[a-z0-9._-]+)*$/i.test(pathname)) pathname = pathname.toLowerCase();
+		else if (!knownPaths.has(normalizedPath)) pathname = '/[redacted]';
+		return `${url.origin}${pathname}`;
+	} catch (_) {
+		return '[invalid URL]';
+	}
+}
+
+function 安全错误摘要(error) {
+	return String(error?.message || error || 'Unknown error')
+		.replace(/[\u0000-\u001f\u007f]+/g, ' ')
+		.replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted URL]')
+		.replace(/\b((?:global)?api[_-]?key|api[_-]?token|x-auth-(?:key|email|token)|account[_-]?id|authorization|access[_-]?token|client[_-]?secret|(?:cf-)?access[-_ ]?(?:jwt[-_ ]?)?(?:assertion|token)|token|password|secret)\s*[:=]\s*(?:Bearer\s+)?["']?([^&\s,"'<>}]+)/gi, '$1=[redacted]')
+		.slice(0, 240);
+}
+
+async function 读取受限请求文本(request, maxBytes = 1024 * 1024) {
+	const declaredLength = Number(request.headers.get('content-length'));
+	const tooLarge = () => Object.assign(new Error('Request body exceeds the configured size limit'), { status: 413 });
+	if (Number.isFinite(declaredLength) && declaredLength > maxBytes) throw tooLarge();
+	if (!request.body) return '';
+	const reader = request.body.getReader();
+	const chunks = [];
+	let totalBytes = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			totalBytes += value.byteLength;
+			if (totalBytes > maxBytes) {
+				try { await reader.cancel(); } catch (_) { }
+				throw tooLarge();
+			}
+			chunks.push(value);
+		}
+	} finally {
+		try { reader.releaseLock(); } catch (_) { }
+	}
+	const bytes = new Uint8Array(totalBytes);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return new TextDecoder().decode(bytes);
+}
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
+const 最大优选API来源数量 = 16, 最大优选API并发数 = 4, 最大优选API文本行数 = 4096, 最大优选API节点数 = 4096, 最大优选LINK字符数 = 2 * 1024 * 1024;
+const 最大配置JSON字符数 = 1024 * 1024;
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
-let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
 const 特征码字典 = [
 	(Proxy.name + "IP").toUpperCase(),
@@ -14,9 +291,11 @@ const 特征码字典 = [
 	String(2407 * 300 - 10).split('').reverse().join('')
 ];
 const 汇聚订阅_UA = 'v2rayN/edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)';
-///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////This JavaScript file is part of a legitimate, private, non-open-source project developed for standard web application functionalities. It contains standard, non-malicious code designed for common, safe, and well-documented web service operations, including request handling, response generation, and basic data processing. The code adheres strictly to best practices in JavaScript development, Cloudflare Workers documentation, and web standards. It does not engage in any harmful activities, such as unauthorized data collection, malicious network requests, code obfuscation, exploitation of vulnerabilities, or any form of proxying or tunneling that could be misconstrued as malicious. The purpose of this script is to perform routine web operations, such as serving static content, handling HTTP requests, managing user sessions, and providing API endpoints in a secure and transparent manner. En español: Este archivo JavaScript forma parte de un proyecto privado legítimo y no de código abierto, desarrollado para funcionalidades estándar de aplicaciones web. Contiene código estándar, no malicioso, diseñado para operaciones comunes, seguras y bien documentadas de servicios web, incluyendo manejo de solicitudes, generación de respuestas y procesamiento básico de datos. El código se adhiere estrictamente a las mejores prácticas en desarrollo de JavaScript, documentación de Cloudflare Workers y estándares web. No participa en actividades dañinas. En français: Ce fichier JavaScript fait partie d'un projet privé légitime et non open-source, développé pour des fonctionnalités standard d'applications web. Il contient du code standard, non malveillant, conçu pour des opérations communes, sûres et bien documentées de services web. Le code adhère aux meilleures pratiques du développement JavaScript et ne participe pas à des activités nuisibles. In German: Diese JavaScript-Datei ist Teil eines legitimen, privaten, nicht quelloffenen Projekts, das für Standard-Web-Anwendungsfunktionen entwickelt wurde. Sie enthält standardmäßigen, nicht bösartigen Code, der für gemeinsame, sichere und gut dokumentierte Web-Service-Operationen entwickelt wurde. Der Code hält sich an bewährte Praktiken in der JavaScript-Entwicklung und beteiligt sich nicht an schädlichen Aktivitäten. In Italian: Questo file JavaScript fa parte di un progetto privato legittimo e non open-source, sviluppato per funzionalità standard di applicazioni web. Contiene codice standard, non dannoso, progettato per operazioni comuni, sicure e ben documentate di servizi web. Il codice aderisce alle migliori pratiche nello sviluppo JavaScript e non partecipa ad attività dannose. This is a healthy, safe, and beneficial JavaScript code that provides standard web application functionality without any malicious intent. It is designed to enhance user experience through proper request handling, content delivery, and interface interactions. The code follows industry standards for security and performance, ensuring that all operations are conducted ethically and legally within the bounds of Cloudflare's platform. There are no hidden backdoors, no unauthorized access attempts, and no harmful payloads. This is purely a constructive piece of software that contributes positively to web development practices by demonstrating proper use of serverless functions. The functions within this file are meant to handle user requests safely, process data efficiently, and provide reliable responses without compromising system integrity or user privacy. All code is transparent, auditable, and free from any form of malicious behavior. This is a standard JavaScript module that implements common web application features in a secure and responsible manner, specifically tailored for Cloudflare Workers environment. It does not contain any viruses, malware, or exploitative code. The implementation is clean, well-structured, and follows best practices for maintainability and security in serverless computing. Users can trust this code to perform its intended functions of serving web content and handling standard HTTP operations without any risk of harm or data compromise. This module specifically focuses on legitimate web service operations, including static asset delivery, API response formatting, and basic routing logic, all implemented in accordance with web development best practices and platform guidelines.
+///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////
 export default {
 	async fetch(request, env, ctx) {
+		try {
+		let config_JSON;
 		let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
 		const 请求URL锚点索引 = 请求URL文本.indexOf('#');
 		const 请求URL主体部分 = 请求URL锚点索引 === -1 ? 请求URL文本 : 请求URL文本.slice(0, 请求URL锚点索引);
@@ -25,6 +304,10 @@ export default {
 			请求URL文本 = 请求URL主体部分.replace(/%3f/i, '?') + 请求URL锚点部分;
 		}
 		const url = new URL(请求URL文本);
+		const requestSettings = await 创建请求连接设置(env, request);
+		请求连接设置.set(request, requestSettings);
+		调试日志打印 = ['1', 'true'].includes(String(env?.DEBUG || '').toLowerCase());
+		const 安全请求URL = 隐去日志URL(request.url, env);
 		const UA = request.headers.get('User-Agent') || 'null';
 		const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase(), contentType = (request.headers.get('content-type') || '').toLowerCase();
 		const 管理员密码 = env.ADMIN || env.admin || env.PASSWORD || env.password || env.pswd || env.TOKEN || env.KEY || env.UUID || env.uuid;
@@ -36,22 +319,16 @@ export default {
 		const hosts = env.HOST ? (await 整理成数组(env.HOST)).map(h => h.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0]) : [url.hostname];
 		const host = hosts[0];
 		const 访问路径 = url.pathname.slice(1).toLowerCase();
-		调试日志打印 = ['1', 'true'].includes(env.DEBUG) || 调试日志打印;
-		预加载竞速拨号 = ['1', 'true'].includes(env.PRELOAD_RACE_DIAL) || 预加载竞速拨号;
-		反代并发拨号数 = Math.max(1, Number(env.PROXY_CONCURRENT_DIAL) || 反代并发拨号数);
-		TCP并发拨号数 = Math.max(1, Number(env.TCP_CONCURRENT_DIAL) || TCP并发拨号数);
-		if (!env.TCP_CONCURRENT_DIAL && TCP并发拨号数 !== 1 && 识别运营商(request) === 'cmcc') TCP并发拨号数 = 1;
-		let 默认反代IP = (`${request.cf.colo}.${特征码字典[0]}.${特征码字典[1]}SsSs.nEt`).toLowerCase(), 默认反代兜底 = true;
-		if (env.PROXYIP) {
-			const proxyIPs = await 整理成数组(env.PROXYIP);
-			默认反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
-			默认反代兜底 = false;
+
+		let 默认反代IP = (`${request.cf?.colo || 'unknown'}.${特征码字典[0]}.${特征码字典[1]}SsSs.nEt`).toLowerCase(), 默认反代兜底 = true;
+		if (env?.PROXYIP != null && String(env.PROXYIP).trim()) {
+			const proxyIPs = (await 整理成数组(String(env.PROXYIP))).map(value => String(value).trim()).filter(Boolean);
+			if (proxyIPs.length > 0) {
+				默认反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+				默认反代兜底 = false;
+			}
 		};
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
-		if (缓存SOCKS5白名单 === null) {
-			if (env.GO2SOCKS5) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(await 整理成数组(env.GO2SOCKS5)))];
-			缓存SOCKS5白名单 = SOCKS5白名单;
-		} else SOCKS5白名单 = 缓存SOCKS5白名单;
 		if (访问路径 === 'version') {// 版本信息接口
 			const 请求UUID = (url.searchParams.get('uuid') || '').toLowerCase();
 			if (uuidRegex.test(请求UUID)) {
@@ -67,21 +344,21 @@ export default {
 			}
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
-			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
+			log(`[WebSocket] 命中请求: ${安全请求URL}`);
 			return await 处理WS请求(request, userID, url, 反代上下文);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/叉HTTP代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
 			const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(userID);
 			const 命中叉HTTP特征 = !!request.headers.get(本机Padding头) || !!url.searchParams.get(本机Padding键);
 			if (!命中叉HTTP特征 && contentType.startsWith('application/grpc')) {
-				log(`[gRPC] 命中请求: ${url.pathname}${url.search}`);
+				log(`[gRPC] 命中请求: ${安全请求URL}`);
 				return await 处理gRPC请求(request, userID, 反代上下文);
 			}
-			log(`[叉HTTP] 命中请求: ${url.pathname}${url.search}`);
+			log(`[叉HTTP] 命中请求: ${安全请求URL}`);
 			return await 处理叉HTTP请求(request, userID, 反代上下文);
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
-			if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
+			if (!管理员密码) return 获取管理页面('/noADMIN', 404);
 			if (env.KV && typeof env.KV.get === 'function') {
 				const 区分大小写访问路径 = url.pathname.slice(1);
 				if (区分大小写访问路径 === 加密秘钥 && 加密秘钥 !== '勿动此默认密钥，有需求请自行通过添加变量KEY进行修改') {//快速订阅
@@ -93,7 +370,9 @@ export default {
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
 					if (authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/admin' } });
 					if (request.method === 'POST') {
-						const formData = await request.text();
+						let formData;
+						try { formData = await 读取受限请求文本(request, 16 * 1024); }
+						catch (error) { if (error?.status === 413) return new Response('Request body too large', { status: 413 }); throw error; }
 						const params = new URLSearchParams(formData);
 						const 输入密码 = params.get('password');
 						if (输入密码 === (typeof 管理员密码 === 'string' ? 管理员密码.replace(/[\r\n]/g, '') : 管理员密码)) {
@@ -103,23 +382,31 @@ export default {
 							return 响应;
 						}
 					}
-					return fetch(Pages静态页面 + '/login');
+					return 获取管理页面('/login');
 				} else if (访问路径 === 'admin' || 访问路径.startsWith('admin/')) {//验证cookie后响应管理页面
 					const cookies = request.headers.get('Cookie') || '';
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
 					// 没有cookie或cookie错误，跳转到/login页面
 					if (!authCookie || authCookie !== await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
 					if (访问路径 === 'admin/log.json') {// 读取日志内容
-						const 读取日志内容 = await env.KV.get('log.json') || '[]';
-						return new Response(读取日志内容, { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+						const savedLogs = await env.KV.get('log.json') || '[]';
+						let logs = [];
+						try {
+							const parsedLogs = JSON.parse(savedLogs);
+							if (Array.isArray(parsedLogs)) logs = parsedLogs.map(item => item && typeof item === 'object'
+								? { ...item, ...(typeof item.URL === 'string' ? { URL: 隐去日志URL(item.URL, env) } : {}) }
+								: item);
+						} catch (_) { }
+						return new Response(JSON.stringify(logs), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' } });
 					} else if (区分大小写访问路径 === 'admin/getCloudflareUsage') {// 查询请求量
+						// The current external UI uses GET query parameters; do not persist this route or cache its response.
 						try {
 							const Usage_JSON = await getCloudflareUsage(url.searchParams.get('Email'), url.searchParams.get('GlobalAPIKey'), url.searchParams.get('AccountID'), url.searchParams.get('APIToken'));
-							return new Response(JSON.stringify(Usage_JSON, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
-						} catch (err) {
-							const errorResponse = { msg: '查询请求量失败，失败原因：' + err.message, error: err.message };
-							return new Response(JSON.stringify(errorResponse, null, 2), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-						}
+							return new Response(JSON.stringify(Usage_JSON, null, 2), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+							} catch (err) {
+								const errorResponse = { msg: '查询请求量失败', error: 'Cloudflare usage check failed' };
+								return new Response(JSON.stringify(errorResponse, null, 2), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
+							}
 					} else if (区分大小写访问路径 === 'admin/getADDAPI') {// 验证优选API
 						if (url.searchParams.get('url')) {
 							const 待验证优选URL = url.searchParams.get('url');
@@ -129,22 +416,21 @@ export default {
 								let 优选API的IP = 请求优选API内容[0].length > 0 ? 请求优选API内容[0] : 请求优选API内容[1];
 								优选API的IP = 优选API的IP.map(item => item.replace(/#(.+)$/, (_, remark) => '#' + decodeURIComponent(remark)));
 								return new Response(JSON.stringify({ success: true, data: 优选API的IP }, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-							} catch (err) {
-								const errorResponse = { msg: '验证优选API失败，失败原因：' + err.message, error: err.message };
-								return new Response(JSON.stringify(errorResponse, null, 2), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-							}
+								} catch (err) {
+									const errorResponse = { msg: '验证优选API失败', error: 安全错误摘要(err) };
+									return new Response(JSON.stringify(errorResponse, null, 2), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
+								}
 						}
 						return new Response(JSON.stringify({ success: false, data: [] }, null, 2), { status: 403, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					} else if (访问路径 === 'admin/check') {// 代理检查
 						const 代理协议 = ['socks5', 'http', 'https', 'turn', 'sstp'].find(类型 => url.searchParams.has(类型)) || null;
-						if (!代理协议) return new Response(JSON.stringify({ error: '缺少代理参数' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+						if (!代理协议) return new Response(JSON.stringify({ error: '缺少代理参数' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 						const 代理参数 = url.searchParams.get(代理协议);
 						const startTime = Date.now();
 						let 检测代理响应;
 						try {
-							const checkParsed = await 获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议));
-							const { username, password, hostname, port } = checkParsed;
-							const 完整代理参数 = username && password ? `${username}:${password}@${hostname}:${port}` : `${hostname}:${port}`;
+								const checkParsed = await 获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议));
+								const { hostname } = checkParsed;
 							try {
 								const 检测主机 = 'cloudflare.com', 检测端口 = 443, encoder = new TextEncoder(), decoder = new TextDecoder();
 								const TCP连接 = 创建请求TCP连接器(request);
@@ -188,21 +474,19 @@ export default {
 										if (headerEndIndex !== -1 && chunked && decoder.decode(responseBuffer).includes('\r\n0\r\n\r\n')) break;
 									}
 									if (headerEndIndex === -1) throw new Error('代理检测响应头过长或无效');
-									const response = decoder.decode(responseBuffer);
-									const ip = response.match(/(?:^|\n)ip=(.*)/)?.[1];
-									const loc = response.match(/(?:^|\n)loc=(.*)/)?.[1];
-									if (!ip || !loc) throw new Error('代理检测响应无效');
-									检测代理响应 = { success: true, proxy: 代理协议 + "://" + 完整代理参数, ip, loc, responseTime: Date.now() - startTime };
+										const traceResponse = decoder.decode(responseBuffer);
+										const { ip, loc } = 解析CloudflareTrace(traceResponse);
+										检测代理响应 = { success: true, ip, loc, responseTime: Date.now() - startTime };
 								} finally {
 									try { tlsSocket ? tlsSocket.close() : await tcpSocket?.close?.() } catch (e) { }
 								}
-							} catch (error) {
-								检测代理响应 = { success: false, error: error.message, proxy: 代理协议 + "://" + 完整代理参数, responseTime: Date.now() - startTime };
+								} catch (error) {
+									检测代理响应 = { success: false, error: 'Proxy check failed', responseTime: Date.now() - startTime };
+								}
+							} catch (err) {
+								检测代理响应 = { success: false, error: 'Proxy check failed', responseTime: Date.now() - startTime };
 							}
-						} catch (err) {
-							检测代理响应 = { success: false, error: err.message, proxy: 代理协议 + "://" + 代理参数, responseTime: Date.now() - startTime };
-						}
-						return new Response(JSON.stringify(检测代理响应, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+							return new Response(JSON.stringify(检测代理响应, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 					}
 
 					config_JSON = await 读取config_JSON(env, host, userID, UA);
@@ -214,13 +498,13 @@ export default {
 							config_JSON.init = '配置已重置为默认值';
 							return new Response(JSON.stringify(config_JSON, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 						} catch (err) {
-							const errorResponse = { msg: '配置重置失败，失败原因：' + err.message, error: err.message };
+							const errorResponse = { msg: '配置重置失败', error: 安全错误摘要(err) };
 							return new Response(JSON.stringify(errorResponse, null, 2), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 						}
 					} else if (request.method === 'POST') {// 处理 KV 操作（POST 请求）
 						if (访问路径 === 'admin/config.json') { // 保存config.json配置
 							try {
-								const newConfig = await request.json();
+								const newConfig = JSON.parse(await 读取受限请求文本(request, 1024 * 1024));
 								// 验证配置完整性
 								if (!newConfig.UUID || !newConfig.HOST) return new Response(JSON.stringify({ error: '配置不完整' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 
@@ -229,12 +513,12 @@ export default {
 								ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
-								console.error('保存配置失败:', error);
-								return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+								console.error('保存配置失败:', 安全错误摘要(error));
+								return new Response(JSON.stringify({ error: '保存配置失败: ' + 安全错误摘要(error) }), { status: error?.status === 413 ? 413 : 500, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 							}
 						} else if (访问路径 === 'admin/cf.json') { // 保存cf.json配置
 							try {
-								const newConfig = await request.json();
+								const newConfig = JSON.parse(await 读取受限请求文本(request, 1024 * 1024));
 								const CF_JSON = { Email: null, GlobalAPIKey: null, AccountID: null, APIToken: null, UsageAPI: null };
 								if (!newConfig.init || newConfig.init !== true) {
 									if (newConfig.Email && newConfig.GlobalAPIKey) {
@@ -255,12 +539,12 @@ export default {
 								ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
-								console.error('保存配置失败:', error);
-								return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+								console.error('保存配置失败:', 安全错误摘要(error));
+								return new Response(JSON.stringify({ error: '保存配置失败: ' + 安全错误摘要(error) }), { status: error?.status === 413 ? 413 : 500, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 							}
 						} else if (访问路径 === 'admin/tg.json') { // 保存tg.json配置
 							try {
-								const newConfig = await request.json();
+								const newConfig = JSON.parse(await 读取受限请求文本(request, 1024 * 1024));
 								if (newConfig.init && newConfig.init === true) {
 									const TG_JSON = { BotToken: null, ChatID: null };
 									await env.KV.put('tg.json', JSON.stringify(TG_JSON, null, 2));
@@ -271,18 +555,18 @@ export default {
 								ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
-								console.error('保存配置失败:', error);
-								return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+								console.error('保存配置失败:', 安全错误摘要(error));
+								return new Response(JSON.stringify({ error: '保存配置失败: ' + 安全错误摘要(error) }), { status: error?.status === 413 ? 413 : 500, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 							}
 						} else if (区分大小写访问路径 === 'admin/ADD.txt') { // 保存自定义优选IP
 							try {
-								const customIPs = await request.text();
+								const customIPs = await 读取受限请求文本(request, 1024 * 1024);
 								await env.KV.put('ADD.txt', customIPs);// 保存到 KV
 								ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Custom_IPs', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: '自定义IP已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
-								console.error('保存自定义IP失败:', error);
-								return new Response(JSON.stringify({ error: '保存自定义IP失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+								console.error('保存自定义IP失败:', 安全错误摘要(error));
+								return new Response(JSON.stringify({ error: '保存自定义IP失败: ' + 安全错误摘要(error) }), { status: error?.status === 413 ? 413 : 500, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 							}
 						} else return new Response(JSON.stringify({ error: '不支持的POST请求路径' }), { status: 404, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					} else if (访问路径 === 'admin/config.json') {// 处理 admin/config.json 请求，返回JSON
@@ -290,13 +574,16 @@ export default {
 					} else if (区分大小写访问路径 === 'admin/ADD.txt') {// 处理 admin/ADD.txt 请求，返回本地优选IP
 						let 本地优选IP = await env.KV.get('ADD.txt') || 'null';
 						if (本地优选IP == 'null') 本地优选IP = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[1];
-						return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': request.cf.asn } });
+						return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': request.cf?.asn || '0' } });
 					} else if (访问路径 === 'admin/cf.json') {// CF配置文件
 						return new Response(JSON.stringify(request.cf, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					}
 
 					ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
-					return fetch(Pages静态页面 + '/admin' + url.search);
+					// The inspected upstream UI only consumes `lite`; avoid forwarding arbitrary query data to its origin.
+					const liteMode = url.searchParams.get('lite');
+					const adminSearch = ['1', 'true', '0', 'false'].includes(liteMode) ? `?lite=${liteMode}` : '';
+					return 获取管理页面('/admin' + adminSearch);
 				} else if (访问路径 === 'logout' || uuidRegex.test(访问路径)) {//清除cookie并跳转到登录页面
 					const 响应 = new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
 					响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
@@ -418,7 +705,7 @@ export default {
 									节点备注 = match[3] || 节点地址;  // 备注,默认为地址本身
 								} else {
 									// 不规范的格式，跳过处理返回null
-									console.warn(`[订阅内容] 不规范的IP格式已忽略: ${原始地址}`);
+									console.warn('[订阅内容] 不规范的 IP 格式已忽略');
 									return null;
 								}
 
@@ -432,7 +719,7 @@ export default {
 										完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), userID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
 										节点备注 = 节点备注.replace(链式代理匹配[0], '').trim() || 节点地址;
 									} catch (error) {
-										console.warn(`[订阅内容] 链式代理解析失败，已忽略该指令: ${链式代理匹配[0]} (${error && error.message ? error.message : error})`);
+										console.warn('[订阅内容] 链式代理解析失败，已忽略该指令:', 安全错误摘要(error));
 									}
 								} else if (反代IP池.length > 0) {
 									const 匹配到的反代IP = 反代IP池.find(p => p.includes(节点地址));
@@ -457,13 +744,13 @@ export default {
 						} else { // 订阅转换
 							const 订阅转换URL = `${config_JSON.订阅转换配置.SUBAPI}/sub?target=${订阅类型}&url=${encodeURIComponent(url.protocol + '//' + url.host + '/sub?target=mixed&token=' + 今日订阅转换后端专属TOKEN + '&cnIspCode=' + 识别运营商(request) + (url.searchParams.has('sub') && url.searchParams.get('sub') != '' ? `&sub=${url.searchParams.get('sub')}` : ''))}&config=${encodeURIComponent(config_JSON.订阅转换配置.SUBCONFIG)}&emoji=${config_JSON.订阅转换配置.SUBEMOJI}&list=${config_JSON.订阅转换配置.SUBLIST}&scv=${config_JSON.跳过证书验证}&xudp=${config_JSON.订阅转换配置.XUDP}&udp=${config_JSON.订阅转换配置.UDP}&tls13=${config_JSON.订阅转换配置.TLS13}&append_type=${config_JSON.订阅转换配置.APPEND_TYPE}&sort=${config_JSON.订阅转换配置.SORT}&expand=${config_JSON.订阅转换配置.EXPAND}`;
 							try {
-								const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)' } });
+								const { response, body } = await 获取外部响应内容(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)' } }, 12000, 4 * 1024 * 1024);
 								if (response.ok) {
-									订阅内容 = await response.text();
+									订阅内容 = 解码外部文本(response, body);
 									if (url.searchParams.has('surge') || ua.includes('surge')) 订阅内容 = Surge订阅配置文件热补丁(订阅内容, url.protocol + '//' + url.host + '/sub?token=' + 订阅TOKEN + '&surge', config_JSON);
 								} else return new Response('订阅转换后端异常：' + response.statusText, { status: response.status });
 							} catch (error) {
-								return new Response('订阅转换后端异常：' + error.message, { status: 403 });
+								return new Response('订阅转换后端暂时不可用。', { status: 502, headers: { 'Cache-Control': 'no-store' } });
 							}
 						}
 
@@ -497,9 +784,17 @@ export default {
 				} else if (访问路径 === 'locations') {//反代locations列表
 					const cookies = request.headers.get('Cookie') || '';
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					if (authCookie && authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
+					if (authCookie && authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) {
+					try {
+						const { response, body } = await 获取外部响应内容('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }, 8000, 2 * 1024 * 1024);
+						return new Response(body, { status: response.status, headers: { 'Content-Type': response.headers.get('content-type') || 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+					} catch (error) {
+						console.warn('[Locations] source unavailable:', error?.name || 'Error');
+						return new Response('Locations data temporarily unavailable.', { status: 502, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
+					}
+				}
 				} else if (访问路径 === 'robots.txt') return new Response('User-agent: *\nDisallow: /', { status: 200, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
-			} else if (!envUUID) return fetch(Pages静态页面 + '/noKV').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
+			} else if (!envUUID) return 获取管理页面('/noKV', 404);
 		}
 
 		let 伪装页URL = env.URL || 'nginx';
@@ -510,22 +805,43 @@ export default {
 			try { const u = new URL(伪装页URL); 伪装页URL = u.protocol + '//' + u.host } catch (e) { 伪装页URL = 'nginx' }
 		}
 		if (伪装页URL === '1101') return new Response(await html1101(url.host, 访问IP), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+		const upstreamController = new AbortController();
+		const upstreamTimeout = setTimeout(() => upstreamController.abort(), 10000);
 		try {
 			const 反代URL = new URL(伪装页URL), 新请求头 = new Headers(request.headers);
 			新请求头.set('Host', 反代URL.host);
 			新请求头.set('Referer', 反代URL.origin);
 			新请求头.set('Origin', 反代URL.origin);
+			if (反代URL.origin !== url.origin) {
+				for (const header of ['Authorization', 'Proxy-Authorization', 'Cookie', 'Cookie2', 'CF-Access-Jwt-Assertion', 'CF-Access-Client-Id', 'CF-Access-Client-Secret', 'X-API-Key', 'X-API-Token', 'X-Auth-Token', 'X-Access-Token']) 新请求头.delete(header);
+			}
 			if (!新请求头.has('User-Agent') && UA && UA !== 'null') 新请求头.set('User-Agent', UA);
-			const 反代响应 = await fetch(反代URL.origin + url.pathname + url.search, { method: request.method, headers: 新请求头, body: request.body, cf: request.cf });
+			const 反代响应 = await fetch(反代URL.origin + url.pathname + url.search, { method: request.method, headers: 新请求头, body: request.body, cf: request.cf, signal: upstreamController.signal });
 			const 内容类型 = 反代响应.headers.get('content-type') || '';
-			// 只处理文本类型的响应
-			if (/text|javascript|json|xml/.test(内容类型)) {
-				const 响应内容 = (await 反代响应.text()).replaceAll(反代URL.host, url.host);
-				return new Response(响应内容, { status: 反代响应.status, headers: { ...Object.fromEntries(反代响应.headers), 'Cache-Control': 'no-store' } });
+			// 文本替换需缓冲，因此限制字节数；二进制资源保持原响应流式转发。
+			if (/text|javascript|json|xml/i.test(内容类型)) {
+				const 原始字节 = await 读取外部响应体(反代响应, 4 * 1024 * 1024);
+				const 响应内容 = 解码外部文本(反代响应, 原始字节).replaceAll(反代URL.host, url.host);
+				const 响应头 = new Headers(反代响应.headers);
+				响应头.delete('content-length');
+				响应头.delete('content-encoding');
+				响应头.set('Cache-Control', 'no-store');
+				return new Response(响应内容, { status: 反代响应.status, headers: 响应头 });
 			}
 			return 反代响应;
-		} catch (error) { }
-		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+		} catch (error) {
+			console.warn('[Camouflage] upstream unavailable:', error?.name || 'Error');
+			return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+		} finally {
+			clearTimeout(upstreamTimeout);
+		}
+		} catch (error) {
+			console.error('[Worker] Unhandled request failure:', error?.name || 'Error', 安全错误摘要(error));
+			return new Response('Internal Worker Error', {
+				status: 500,
+				headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' },
+			});
+		}
 	}
 };
 ///////////////////////////////////////////////////////////////////////叉HTTP传输数据///////////////////////////////////////////////
@@ -651,7 +967,7 @@ async function 处理叉HTTP请求(request, yourUUID, 反代上下文 = {}) {
 	try {
 		socket = await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, 占位WS, 首包.respHeader, remoteConnWrapper, yourUUID, request, 反代上下文, 首包.协议 === 'trojan', 首包.原始数据, true);
 	} catch (err) {
-		log(`[叉HTTP-Pipe] 连接失败: ${err?.message || err}`);
+		log(`[叉HTTP-Pipe] 连接失败: ${安全错误摘要(err)}`);
 		清理(err);
 		return new Response('bad gateway', { status: 502 });
 	}
@@ -762,7 +1078,7 @@ function 处理叉HTTPUDP请求(首包, reader, request, 反代上下文, respon
 				}
 			} catch (err) {
 				转发失败 = true;
-				log(`[叉HTTP转发] 处理失败: ${err?.message || err}`);
+				log(`[叉HTTP转发] 处理失败: ${安全错误摘要(err)}`);
 				closeSocketQuietly(叉桥);
 			} finally {
 				const 保持木马UDP反代下行 = !转发失败 && 首包.协议 === 'trojan' && 木马UDP上下文.反代地址 && 木马UDP上下文.反代Socket;
@@ -1224,7 +1540,7 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 				await 上行写入队列.等待空();
 			} catch (err) {
 				转发失败 = true;
-				log(`[gRPC转发] 处理失败: ${err?.message || err}`);
+				log(`[gRPC转发] 处理失败: ${安全错误摘要(err)}`);
 			} finally {
 				const 保持木马UDP反代下行 = !转发失败 && isDnsQuery && 判断是否是木马 && 木马UDP上下文.反代地址 && 木马UDP上下文.反代Socket;
 				if (保持木马UDP反代下行) {
@@ -1525,7 +1841,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 							}
 						});
 					}).catch((error) => {
-						log(`[SS发送] 加密失败: ${error?.message || error}`);
+						log(`[SS发送] 加密失败: ${安全错误摘要(error)}`);
 						closeSocketQuietly(serverSock);
 					});
 					return SS发送队列;
@@ -1569,7 +1885,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 		} catch (err) {
 			const msg = err?.message || `${err}`;
 			if (msg.includes('Decryption failed') || msg.includes('SS handshake decrypt failed') || msg.includes('SS length decrypt failed')) {
-				log(`[SS入站] 解密失败，连接关闭: ${msg}`);
+				log(`[SS入站] 解密失败，连接关闭: ${安全错误摘要(msg)}`);
 				closeSocketQuietly(serverSock);
 				return;
 			}
@@ -2168,6 +2484,8 @@ async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 }
 
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null, 反代上下文 = {}, 允许木马反代 = false, 木马反代首包数据 = null, 仅建立连接 = false) {
+	const requestSettings = request && typeof request === 'object' ? 请求连接设置.get(request) : null;
+	const { TCP并发拨号数, 反代并发拨号数, 预加载竞速拨号, SOCKS5白名单 } = requestSettings || 默认请求连接设置;
 	const ctx反代IP = 反代上下文.反代IP || '';
 	const ctx代理类型 = 反代上下文.代理类型 !== undefined ? 反代上下文.代理类型 : null;
 	const ctx代理全局 = 反代上下文.代理全局 !== undefined ? 反代上下文.代理全局 : false;
@@ -2207,7 +2525,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		if (仅建立连接) return socket;
 		connectStreams(socket, ws, 取出响应头, retryFunc, 连接仍有效, remoteConnWrapper).catch(err => {
 			if (!连接仍有效()) return;
-			log(`[TCP下行] 处理失败: ${err?.message || err}`);
+			log(`[TCP下行] 处理失败: ${安全错误摘要(err)}`);
 			try { socket?.close?.() } catch (e) { }
 			closeSocketQuietly(ws);
 		});
@@ -2311,7 +2629,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			return socket;
 		} catch (err) {
 			try { socket?.close?.() } catch (e) { }
-			if (预加载候选列表) log(`[TCP直连] 预加载竞速失败: ${err.message || err}`);
+			if (预加载候选列表) log(`[TCP直连] 预加载竞速失败: ${安全错误摘要(err)}`);
 			throw err;
 		}
 	}
@@ -2338,7 +2656,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					return socket;
 				} catch (err) {
 					try { socket?.close?.() } catch (e) { }
-					log(`[反代连接] 本批连接失败: ${err.message || err}`);
+					log(`[反代连接] 本批连接失败: ${安全错误摘要(err)}`);
 				}
 			}
 		}
@@ -2430,13 +2748,13 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 	remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包);
 
-	if (ctx代理类型 && (ctx代理全局 || SOCKS5白名单.some(p => new RegExp(`^${p.replace(/\*/g, '.*')}$`, 'i').test(host)))) {
+	if (ctx代理类型 && (ctx代理全局 || 匹配白名单域名(host, SOCKS5白名单))) {
 		log(`[TCP转发] 启用 SOCKS5/HTTP/HTTPS/TURN/SSTP 全局代理`);
 		try {
 			await connecttoPry();
 			if (仅建立连接) return remoteConnWrapper.socket;
 		} catch (err) {
-			log(`[TCP转发] SOCKS5/HTTP/HTTPS/TURN/SSTP 代理连接失败: ${err.message}`);
+			log(`[TCP转发] SOCKS5/HTTP/HTTPS/TURN/SSTP 代理连接失败: ${安全错误摘要(err)}`);
 			throw err;
 		}
 	} else {
@@ -2452,7 +2770,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			});
 			if (仅建立连接) return initialSocket;
 		} catch (err) {
-			log(`[TCP转发] 直连 ${host}:${portNum} 失败: ${err.message}`);
+			log(`[TCP转发] 直连 ${host}:${portNum} 失败: ${安全错误摘要(err)}`);
 			if (remoteConnWrapper.generation !== 直连世代) throw err;
 			if (err instanceof Error && err.name === '预加载解析为空') {
 				closeSocketQuietly(ws);
@@ -2501,7 +2819,7 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 			},
 		}));
 	} catch (error) {
-		log(`[UDP转发] DNS 转发失败: ${error?.message || error}`);
+		log(`[UDP转发] DNS 转发失败: ${安全错误摘要(error)}`);
 	}
 }
 
@@ -2769,7 +3087,7 @@ function 创建上行写入队列({ 获取写入器, 获取连接任务 = null, 
 		} catch (err) {
 			closed = true;
 			clear(err);
-			log(`[${名称}] 写入失败: ${err?.message || err}`);
+			log(`[${名称}] 写入失败: ${安全错误摘要(err)}`);
 			try { 关闭连接?.(err) } catch (_) { }
 		} finally {
 			draining = false;
@@ -3250,7 +3568,7 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, pars
 			tlsSocket = await 打开HTTPS代理TLS(false);
 		} catch (error) {
 			if (!/cipher|handshake|TLS Alert|ServerHello|Finished|Unsupported|Missing TLS/i.test(error?.message || `${error || ''}`)) throw error;
-			log(`[HTTPS代理] AES-GCM TLS 握手失败，回退 ChaCha20 兼容模式: ${error?.message || error}`);
+			log(`[HTTPS代理] AES-GCM TLS 握手失败，回退 ChaCha20 兼容模式: ${安全错误摘要(error)}`);
 			tlsSocket = await 打开HTTPS代理TLS(true);
 		}
 
@@ -4034,6 +4352,15 @@ function isIPHostname(hostname = '') {
 	} catch (e) {
 		return false;
 	}
+}
+
+function 解析CloudflareTrace(traceText) {
+	if (typeof traceText !== 'string') throw new Error('Invalid trace response');
+	const readField = name => traceText.match(new RegExp(`(?:^|\\r?\\n)${name}=([^\\r\\n]*)`))?.[1]?.trim() || '';
+	const ip = readField('ip');
+	const loc = readField('loc');
+	if (!isIPHostname(ip) || !/^[A-Z]{2}$/i.test(loc)) throw new Error('Invalid trace response');
+	return { ip: stripIPv6Brackets(ip), loc: loc.toUpperCase() };
 }
 
 //////////////////////////////////////////////////turnConnect///////////////////////////////////////////////
@@ -5310,7 +5637,7 @@ async function Singbox订阅配置文件热补丁(SingBox_原始订阅内容, co
 
 		return JSON.stringify(config, null, 2);
 	} catch (e) {
-		console.error("Singbox热补丁执行失败:", e);
+		console.error('Singbox热补丁执行失败:', 安全错误摘要(e));
 		return JSON.stringify(JSON.parse(sb_json_text), null, 2);
 	}
 }
@@ -5337,7 +5664,7 @@ function Surge订阅配置文件热补丁(content, url, config_JSON) {
 async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SUB", config_JSON, 是否写入KV日志 = true) {
 	try {
 		const 当前时间 = new Date();
-		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
+		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: 隐去日志URL(request.url, env), UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
 		if (config_JSON.TG.启用) {
 			try {
 				const TG_TXT = await env.KV.get('tg.json');
@@ -5355,16 +5682,16 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 						`🤖 <b>UA：</b><code>${日志内容.UA}</code>\n` +
 						`📅 <b>时间：</b>${请求时间}\n` +
 						`${config_JSON.CF.Usage.success ? `📊 <b>请求用量：</b>${config_JSON.CF.Usage.total}/${config_JSON.CF.Usage.max} <b>${((config_JSON.CF.Usage.total / config_JSON.CF.Usage.max) * 100).toFixed(2)}%</b>\n` : ''}`;
-					await fetch(`https://api.telegram.org/bot${TG_JSON.BotToken}/sendMessage?chat_id=${TG_JSON.ChatID}&parse_mode=HTML&text=${encodeURIComponent(msg)}`, {
+					await 获取外部响应内容(`https://api.telegram.org/bot${TG_JSON.BotToken}/sendMessage?chat_id=${TG_JSON.ChatID}&parse_mode=HTML&text=${encodeURIComponent(msg)}`, {
 						method: 'GET',
 						headers: {
 							'Accept': 'text/html,application/xhtml+xml,application/xml;',
 							'Accept-Encoding': 'gzip, deflate, br',
 							'User-Agent': 日志内容.UA || 'Unknown',
 						}
-					});
+					}, 5000, 64 * 1024);
 				}
-			} catch (error) { console.error(`读取tg.json出错: ${error.message}`) }
+			} catch (error) { console.error('读取tg.json失败:', 安全错误摘要(error)) }
 		}
 		是否写入KV日志 = ['1', 'true'].includes(env.OFF_LOG) ? false : 是否写入KV日志;
 		if (!是否写入KV日志) return;
@@ -5376,7 +5703,7 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 				if (!Array.isArray(日志数组)) { 日志数组 = [日志内容] }
 				else if (请求类型 !== "Get_SUB") {
 					const 三十分钟前时间戳 = 当前时间.getTime() - 30 * 60 * 1000;
-					if (日志数组.some(log => log.TYPE !== "Get_SUB" && log.IP === 访问IP && log.URL === request.url && log.UA === (request.headers.get('User-Agent') || 'Unknown') && log.TIME >= 三十分钟前时间戳)) return;
+					if (日志数组.some(log => log.TYPE !== "Get_SUB" && log.IP === 访问IP && log.URL === 日志内容.URL && log.UA === (request.headers.get('User-Agent') || 'Unknown') && log.TIME >= 三十分钟前时间戳)) return;
 					日志数组.push(日志内容);
 					while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
 				} else {
@@ -5386,7 +5713,7 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 			} catch (e) { 日志数组 = [日志内容] }
 		} else { 日志数组 = [日志内容] }
 		await env.KV.put('log.json', JSON.stringify(日志数组, null, 2));
-	} catch (error) { console.error(`日志记录失败: ${error.message}`) }
+	} catch (error) { console.error('日志记录失败:', 安全错误摘要(error)) }
 }
 
 function 掩码敏感信息(文本, 前缀长度 = 3, 后缀长度 = 2) {
@@ -5479,21 +5806,25 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 
 		// 通过 POST 发送 dns-message 请求
 		log(`[DoH查询] 发送查询报文 ${域名} via ${DoH解析服务} (type=${qtype}, ${query.length}字节)`);
-		const response = await fetch(DoH解析服务, {
+		const { response, body } = await 获取外部响应内容(DoH解析服务, {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/dns-message',
 				'Accept': 'application/dns-message',
 			},
 			body: query,
-		});
+		}, 5000, 65535);
 		if (!response.ok) {
-			console.warn(`[DoH查询] 请求失败 ${域名} ${记录类型} via ${DoH解析服务} 响应代码:${response.status}`);
+			console.warn('[DoH查询] 请求失败，HTTP 状态码:', response.status);
 			return [];
 		}
 
 		// 解析 DNS 响应报文
-		const buf = new Uint8Array(await response.arrayBuffer());
+		const buf = body;
+		if (buf.byteLength < 12) {
+			console.warn('[DoH查询] DNS 响应报文过短');
+			return [];
+		}
 		const dv = new DataView(buf.buffer);
 		const qdcount = dv.getUint16(4);
 		const ancount = dv.getUint16(6);
@@ -5590,13 +5921,17 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 		return answers;
 	} catch (error) {
 		const 耗时 = (performance.now() - 开始时间).toFixed(2);
-		console.error(`[DoH查询] 查询失败 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms:`, error);
+		console.error(`[DoH查询] 查询失败 ${记录类型} ${耗时}ms:`, 安全错误摘要(error));
 		return [];
 	}
 }
 
 async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重置配置 = false) {
+	let config_JSON;
 	const _p = 特征码字典[0];
+	const 环境SOCKS5白名单 = env?.GO2SOCKS5 && String(env.GO2SOCKS5).trim()
+		? [...new Set([...默认SOCKS5白名单, ...(await 整理成数组(String(env.GO2SOCKS5))).map(value => String(value).trim()).filter(Boolean)])]
+		: [...默认SOCKS5白名单];
 	const host = hostname, Ali_DoH = "https://dns.alidns.com/dns-query", ECH_SNI = "cloudflare-ech.com", 占位符 = '{{IP:PORT}}', 初始化开始时间 = performance.now(), 默认配置JSON = {
 		TIME: new Date().toISOString(),
 		HOST: host,
@@ -5652,7 +5987,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 				启用: null,
 				全局: false,
 				账号: '',
-				白名单: SOCKS5白名单,
+				白名单: 环境SOCKS5白名单,
 			},
 			路径模板: {
 				[_p]: "proxyip=" + 占位符,
@@ -5703,13 +6038,18 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 		let configJSON = await env.KV.get('config.json');
 		if (!configJSON || 重置配置 == true) {
 			await env.KV.put('config.json', JSON.stringify(默认配置JSON, null, 2));
-			config_JSON = 默认配置JSON;
+			config_JSON = 复制配置值(默认配置JSON);
 		} else {
-			config_JSON = JSON.parse(configJSON);
+			if (typeof configJSON !== 'string' || configJSON.length > 最大配置JSON字符数) throw new Error('Stored config exceeds the configured size limit');
+			const storedConfig = JSON.parse(configJSON);
+			config_JSON = 合并配置默认值(默认配置JSON, storedConfig);
+			const hasLegacySS = storedConfig && typeof storedConfig === 'object' && !Array.isArray(storedConfig)
+				&& storedConfig.SS && typeof storedConfig.SS === 'object' && !Array.isArray(storedConfig.SS);
+			if (!hasLegacySS) config_JSON.SS = { 加密方式: 'aes-128-gcm', TLS: false };
 		}
 	} catch (error) {
-		console.error(`读取config_JSON出错: ${error.message}`);
-		config_JSON = 默认配置JSON;
+		console.warn('读取config_JSON失败，使用默认配置:', error?.name || 'Error');
+		config_JSON = 复制配置值(默认配置JSON);
 	}
 
 	if (!config_JSON.订阅转换配置.SUBLIST) config_JSON.订阅转换配置.SUBLIST = false;
@@ -5808,7 +6148,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			config_JSON.TG.BotToken = TG_JSON.BotToken ? 掩码敏感信息(TG_JSON.BotToken) : null;
 		}
 	} catch (error) {
-		console.error(`读取tg.json出错: ${error.message}`);
+		console.error('读取tg.json失败:', 安全错误摘要(error));
 	}
 
 	const 初始化CF_JSON = { Email: null, GlobalAPIKey: null, AccountID: null, APIToken: null, UsageAPI: null };
@@ -5821,11 +6161,11 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			const CF_JSON = JSON.parse(CF_TXT);
 			if (CF_JSON.UsageAPI) {
 				try {
-					const response = await fetch(CF_JSON.UsageAPI);
-					const Usage = await response.json();
-					config_JSON.CF.Usage = Usage;
+					const { response, data } = await 获取外部JSON(CF_JSON.UsageAPI, {}, 8000, 256 * 1024);
+					if (!response.ok) throw new Error(`Usage endpoint returned HTTP ${response.status}`);
+					config_JSON.CF.Usage = 规范化Cloudflare用量(data);
 				} catch (err) {
-					console.error(`请求 CF_JSON.UsageAPI 失败: ${err.message}`);
+					console.warn('Cloudflare usage endpoint unavailable:', err?.name || 'Error');
 				}
 			} else {
 				config_JSON.CF.Email = CF_JSON.Email ? CF_JSON.Email : null;
@@ -5838,7 +6178,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			}
 		}
 	} catch (error) {
-		console.error(`读取cf.json出错: ${error.message}`);
+		console.error('读取cf.json失败:', 安全错误摘要(error));
 	}
 
 	config_JSON.加载时间 = (performance.now() - 初始化开始时间).toFixed(2) + 'ms';
@@ -5875,39 +6215,65 @@ function 识别运营商(request) {
 	return 命中运营商 || ASN运营商映射[String(cf?.asn || '')] || 'cf';
 }
 
+function 解析IPv4CIDR(value) {
+	if (typeof value !== 'string') return null;
+	const parts = value.trim().split('/');
+	if (parts.length > 2 || !parts[0]) return null;
+	const octets = parts[0].split('.');
+	if (octets.length !== 4 || octets.some(part => !/^\d{1,3}$/.test(part) || Number(part) > 255)) return null;
+	const prefix = parts.length === 1 ? 32 : Number(parts[1]);
+	if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return null;
+	const base = octets.reduce((value, octet) => value * 256 + Number(octet), 0) >>> 0;
+	const hostBits = 32 - prefix;
+	const mask = hostBits === 32 ? 0 : (0xFFFFFFFF << hostBits) >>> 0;
+	return { base: (base & mask) >>> 0, hostBits };
+}
+
 async function 生成随机IP(request, count = 16, 指定端口 = -1) {
 	const url = new URL(request.url);
 	const 查询参数运营商 = String(url.searchParams.get('cnIspCode') || '').toLowerCase();
 	const 运营商文件标识 = ['ct', 'cu', 'cmcc', 'cf'].includes(查询参数运营商) ? 查询参数运营商 : 识别运营商(request);
 	const 运营商名称映射 = {
-		cmcc: 'CF移动优选',
-		cu: 'CF联通优选',
-		ct: 'CF电信优选',
-		cf: 'CF官方优选',
+		cmcc: 'CF China Mobile Preferred',
+		cu: 'CF China Unicom Preferred',
+		ct: 'CF China Telecom Preferred',
+		cf: 'CF Official Preferred',
 	};
 	const cidr_url = 运营商文件标识 === 'cf' ? `https://raw.githubusercontent.com/${特征码字典[1]}/${特征码字典[1]}/main/CF-CIDR.txt` : `https://raw.githubusercontent.com/${特征码字典[1]}/${特征码字典[1]}/main/CF-CIDR/${运营商文件标识}.txt`;
-	const cfname = 运营商名称映射[运营商文件标识] || 'CF官方优选';
+	const cfname = 运营商名称映射[运营商文件标识] || 'CF Official Preferred';
 	const cfport = [443, 2053, 2083, 2087, 2096, 8443];
+	const parsedCount = Number(count);
+	const safeCount = Number.isFinite(parsedCount) ? Math.min(99, Math.max(1, Math.floor(parsedCount))) : 16;
+	const requestedPort = Number(指定端口);
+	const safePort = requestedPort === -1 || cfport.includes(requestedPort) ? requestedPort : -1;
+	const fallbackCIDR = 解析IPv4CIDR('104.16.0.0/13');
 	let cidrList = [];
-	try { const res = await fetch(cidr_url); cidrList = res.ok ? await 整理成数组(await res.text()) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
+	try {
+		const { response, body } = await 获取外部响应内容(cidr_url, { headers: { Accept: 'text/plain' } }, 5000, 256 * 1024);
+		if (response.ok) {
+			const cidrText = new TextDecoder().decode(body);
+			cidrList = (await 整理成数组(cidrText))
+				.map(value => value.split('#', 1)[0].trim())
+				.map(解析IPv4CIDR)
+				.filter(Boolean);
+		}
+	} catch (error) {
+		console.warn('[Preferred IP] CIDR source unavailable; using fallback range:', error?.name || 'Error');
+	}
+	if (cidrList.length === 0) cidrList = [fallbackCIDR];
 
-	const generateRandomIPFromCIDR = (cidr) => {
-		const [baseIP, prefixLength] = cidr.split('/'), prefix = parseInt(prefixLength), hostBits = 32 - prefix;
-		const ipInt = baseIP.split('.').reduce((a, p, i) => a | (parseInt(p) << (24 - i * 8)), 0);
-		const randomOffset = Math.floor(Math.random() * Math.pow(2, hostBits));
-		const mask = (0xFFFFFFFF << hostBits) >>> 0, randomIP = (((ipInt & mask) >>> 0) + randomOffset) >>> 0;
+	const generateRandomIPFromCIDR = cidr => {
+		const randomOffset = Math.floor(Math.random() * Math.pow(2, cidr.hostBits));
+		const randomIP = (cidr.base + randomOffset) >>> 0;
 		return [(randomIP >>> 24) & 0xFF, (randomIP >>> 16) & 0xFF, (randomIP >>> 8) & 0xFF, randomIP & 0xFF].join('.');
 	};
-	const randomIPs = Array.from({ length: count }, (_, index) => {
+	const randomIPs = Array.from({ length: safeCount }, (_, index) => {
 		const ip = generateRandomIPFromCIDR(cidrList[Math.floor(Math.random() * cidrList.length)]);
-		const 目标端口 = 指定端口 === -1
-			? cfport[Math.floor(Math.random() * cfport.length)]
-			: 指定端口;
-		return `${ip}:${目标端口}#${cfname}${index + 1}`;
+		const targetPort = safePort === -1 ? cfport[Math.floor(Math.random() * cfport.length)] : safePort;
+		return `${ip}:${targetPort}#${cfname} ${index + 1}`;
 	});
 	return [randomIPs, randomIPs.join('\n')];
 }
-
 async function 整理成数组(内容) {
 	var 替换后的内容 = 内容.replace(/[	"'\r\n]+/g, ',').replace(/,+/g, ',');
 	if (替换后的内容.charAt(0) == ',') 替换后的内容 = 替换后的内容.slice(1);
@@ -5917,61 +6283,82 @@ async function 整理成数组(内容) {
 }
 
 async function 获取优选订阅生成器数据(优选订阅生成器HOST) {
-	let 优选IP = [], 其他节点LINK = '', 格式化HOST = 优选订阅生成器HOST.replace(/^sub:\/\//i, 'https://').split('#')[0].split('?')[0];
+	const inputHost = typeof 优选订阅生成器HOST === 'string' ? 优选订阅生成器HOST.trim() : '';
+	if (!inputHost) return [[], ''];
+	let 优选IP = [], 其他节点LINK = '';
+	let 格式化HOST = inputHost.replace(/^sub:\/\//i, 'https://').split('#')[0].split('?')[0];
 	if (!/^https?:\/\//i.test(格式化HOST)) 格式化HOST = `https://${格式化HOST}`;
 
+	let generatorURL;
 	try {
 		const url = new URL(格式化HOST);
-		格式化HOST = url.origin;
-	} catch (error) {
-		优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST}优选订阅生成器格式化异常:${error.message}`);
-		return [优选IP, 其他节点LINK];
+		if (!['http:', 'https:'].includes(url.protocol)) return [[], ''];
+		generatorURL = `${url.origin}/sub?host=example.com&uuid=00000000-0000-4000-8000-000000000000`;
+	} catch (_) {
+		console.warn('[Preferred subscription] Invalid generator URL');
+		return [[], ''];
 	}
 
-	const 优选订阅生成器URL = `${格式化HOST}/sub?host=example.com&uuid=00000000-0000-4000-8000-000000000000`;
-
 	try {
-		const response = await fetch(优选订阅生成器URL, {
-			headers: { 'User-Agent': 汇聚订阅_UA }
-		});
-
+		const { response, body } = await 获取外部响应内容(generatorURL, {
+			headers: { 'User-Agent': 汇聚订阅_UA },
+		}, 8000, 4 * 1024 * 1024);
 		if (!response.ok) {
-			优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST}优选订阅生成器异常:${response.statusText}`);
+			console.warn('[Preferred subscription] Generator returned HTTP', response.status);
 			return [优选IP, 其他节点LINK];
 		}
 
-		const 优选订阅生成器返回订阅内容 = atob(await response.text());
-		const 订阅行列表 = 优选订阅生成器返回订阅内容.includes('\r\n')
-			? 优选订阅生成器返回订阅内容.split('\r\n')
-			: 优选订阅生成器返回订阅内容.split('\n');
+		const 优选订阅生成器返回订阅内容 = atob(new TextDecoder().decode(body));
+		const 订阅行列表 = 分割受限文本行(优选订阅生成器返回订阅内容, 最大优选API文本行数);
 
 		for (const 行内容 of 订阅行列表) {
-			if (!行内容.trim()) continue; // 跳过空行
+			if (!行内容.trim()) continue;
 			if (行内容.includes('00000000-0000-4000-8000-000000000000') && 行内容.includes('example.com')) {
-				// 这是优选IP行，提取 域名:端口#备注
 				const 地址匹配 = 行内容.match(/:\/\/[^@]+@([^?]+)/);
-				if (地址匹配) {
-					let 地址端口 = 地址匹配[1], 备注 = ''; // 域名:端口 或 IP:端口
-					const 备注匹配 = 行内容.match(/#(.+)$/);
-					if (备注匹配) 备注 = '#' + decodeURIComponent(备注匹配[1]);
-					优选IP.push(地址端口 + 备注);
+				if (!地址匹配) continue;
+				const 地址端口 = 地址匹配[1];
+				let 备注 = '';
+				const 备注匹配 = 行内容.match(/#(.+)$/);
+				if (备注匹配) {
+					try { 备注 = '#' + decodeURIComponent(备注匹配[1]); }
+					catch (_) { 备注 = '#' + 备注匹配[1]; }
 				}
+				优选IP.push(地址端口 + 备注);
 			} else {
 				其他节点LINK += 行内容 + '\n';
 			}
 		}
 	} catch (error) {
-		优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST}优选订阅生成器异常:${error.message}`);
+		console.warn('[Preferred subscription] Generator request failed:', error?.name || 'Error');
 	}
 
 	return [优选IP, 其他节点LINK];
 }
-
 async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) {
-	if (!urls?.length) return [[], [], [], []];
+	if (!Array.isArray(urls) || urls.length === 0) return [[], [], [], []];
+	const sourceURLs = urls.slice(0, 最大优选API来源数量);
+	if (urls.length > sourceURLs.length) console.warn('[Preferred API] Source limit reached; extra configured sources were skipped:', urls.length - sourceURLs.length);
 	const results = new Set(), 反代IP池 = new Set();
 	let 订阅链接响应的明文LINK内容 = '', 需要订阅转换订阅URLs = [];
-	await Promise.allSettled(urls.map(async (url) => {
+	const 添加优选IP = value => {
+		if (typeof value === 'string' && results.size < 最大优选API节点数) results.add(value);
+	};
+	const 添加反代IP = value => {
+		if (typeof value === 'string' && 反代IP池.size < 最大优选API节点数) 反代IP池.add(value);
+	};
+	const 添加订阅链接 = content => {
+		let remaining = 最大优选LINK字符数 - 订阅链接响应的明文LINK内容.length;
+		if (remaining <= 0 || typeof content !== 'string') return;
+		for (const line of 分割受限文本行(content, 最大优选API文本行数)) {
+			const lineLength = line.length + 1;
+			if (lineLength > remaining) break;
+			订阅链接响应的明文LINK内容 += line + '\n';
+			remaining -= lineLength;
+		}
+	};
+	for (let offset = 0; offset < sourceURLs.length; offset += 最大优选API并发数) {
+		const sourceBatch = sourceURLs.slice(offset, offset + 最大优选API并发数);
+		await Promise.allSettled(sourceBatch.map(async (url) => {
 		// 检查URL是否包含备注名
 		const hashIndex = url.indexOf('#');
 		const urlWithoutHash = hashIndex > -1 ? url.substring(0, hashIndex) : url;
@@ -5986,13 +6373,13 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 						const 处理后IP = ip.includes('#')
 							? `${ip} [${API备注名}]`
 							: `${ip}#[${API备注名}]`;
-						results.add(处理后IP);
-						if (优选IP作为反代IP) 反代IP池.add(ip.split('#')[0]);
+						添加优选IP(处理后IP);
+						if (优选IP作为反代IP) 添加反代IP(ip.split('#')[0]);
 					}
 				} else {
 					for (const ip of 优选IP) {
-						results.add(ip);
-						if (优选IP作为反代IP) 反代IP池.add(ip.split('#')[0]);
+						添加优选IP(ip);
+						if (优选IP作为反代IP) 添加反代IP(ip.split('#')[0]);
 					}
 				}
 				// 处理第二个数组 - 其他节点LINK
@@ -6003,22 +6390,19 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 							: `${link}${encodeURIComponent(`#[${API备注名}]`)}`;
 						return `${完整链接}${lineEnd}`;
 					});
-					订阅链接响应的明文LINK内容 += 处理后LINK内容;
+					添加订阅链接(处理后LINK内容);
 				} else if (其他节点LINK && typeof 其他节点LINK === 'string') {
-					订阅链接响应的明文LINK内容 += 其他节点LINK;
+					添加订阅链接(其他节点LINK);
 				}
 			} catch (e) { }
 			return;
 		}
 
 		try {
-			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), 超时时间);
-			const response = await fetch(urlWithoutHash, { signal: controller.signal, headers: { 'User-Agent': 汇聚订阅_UA } });
-			clearTimeout(timeoutId);
+			const { response, body: buffer } = await 获取外部响应内容(urlWithoutHash, { headers: { 'User-Agent': 汇聚订阅_UA } }, 超时时间, 4 * 1024 * 1024);
+			if (!response.ok) return;
 			let text = '';
 			try {
-				const buffer = await response.arrayBuffer();
 				const contentType = (response.headers.get('content-type') || '').toLowerCase();
 				const charset = contentType.match(/charset=([^\s;]+)/i)?.[1]?.toLowerCase() || '';
 
@@ -6050,7 +6434,7 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 
 				// 如果所有编码都失败或无效，尝试 response.text()
 				if (!decodeSuccess) {
-					text = await response.text();
+					text = new TextDecoder().decode(buffer);
 				}
 
 				// 如果返回的是空或无效数据，返回
@@ -6058,7 +6442,7 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 					return;
 				}
 			} catch (e) {
-				console.error('Failed to decode response:', e);
+				console.error('Preferred API response decode failed:', 安全错误摘要(e));
 				return;
 			}
 
@@ -6074,27 +6458,27 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 			const cleanText = typeof text === 'string' ? text.replace(/\s/g, '') : '';
 			if (cleanText.length > 0 && cleanText.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(cleanText)) {
 				try {
-					const bytes = new Uint8Array(atob(cleanText).split('').map(c => c.charCodeAt(0)));
-					预处理订阅明文内容 = new TextDecoder('utf-8').decode(bytes);
+					预处理订阅明文内容 = 解码Base64文本(cleanText);
 				} catch { }
 			}
-			if (预处理订阅明文内容.split('#')[0].includes('://')) {
+			const 受限订阅文本 = 分割受限文本行(预处理订阅明文内容, 最大优选API文本行数).join('\n');
+			if (受限订阅文本.split('#')[0].includes('://')) {
 				// 处理LINK内容
 				if (API备注名) {
-					const 处理后LINK内容 = 预处理订阅明文内容.replace(/([a-z][a-z0-9+\-.]*:\/\/[^\r\n]*?)(\r?\n|$)/gi, (match, link, lineEnd) => {
+					const 处理后LINK内容 = 受限订阅文本.replace(/([a-z][a-z0-9+\-.]*:\/\/[^\r\n]*?)(\r?\n|$)/gi, (match, link, lineEnd) => {
 						const 完整链接 = link.includes('#')
 							? `${link}${encodeURIComponent(` [${API备注名}]`)}`
 							: `${link}${encodeURIComponent(`#[${API备注名}]`)}`;
 						return `${完整链接}${lineEnd}`;
 					});
-					订阅链接响应的明文LINK内容 += 处理后LINK内容 + '\n';
+					添加订阅链接(处理后LINK内容);
 				} else {
-					订阅链接响应的明文LINK内容 += 预处理订阅明文内容 + '\n';
+					添加订阅链接(受限订阅文本);
 				}
 				return;
 			}
 
-			const lines = text.trim().split('\n').map(l => l.trim()).filter(l => l);
+			const lines = 分割受限文本行(预处理订阅明文内容, 最大优选API文本行数);
 			const isCSV = lines.length > 1 && lines[0].includes(',');
 			const IPV6_PATTERN = /^[^\[\]]*:[^\[\]]*:[^\[\]]/;
 			const parsedUrl = new URL(urlWithoutHash);
@@ -6116,11 +6500,11 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 						const 处理后IP = ipItem.includes('#')
 							? `${ipItem} [${API备注名}]`
 							: `${ipItem}#[${API备注名}]`;
-						results.add(处理后IP);
+						添加优选IP(处理后IP);
 					} else {
-						results.add(ipItem);
+						添加优选IP(ipItem);
 					}
-					if (优选IP作为反代IP) 反代IP池.add(ipItem.split('#')[0]);
+					if (优选IP作为反代IP) 添加反代IP(ipItem.split('#')[0]);
 				});
 			} else {
 				const headers = lines[0].split(',').map(h => h.trim());
@@ -6138,11 +6522,11 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 						// 处理第一个数组 - 优选IP
 						if (API备注名) {
 							const 处理后IP = `${ipItem} [${API备注名}]`;
-							results.add(处理后IP);
+							添加优选IP(处理后IP);
 						} else {
-							results.add(ipItem);
+							添加优选IP(ipItem);
 						}
-						if (优选IP作为反代IP) 反代IP池.add(`${wrappedIP}:${cols[portIdx]}`);
+						if (优选IP作为反代IP) 添加反代IP(`${wrappedIP}:${cols[portIdx]}`);
 					});
 				} else if (headers.some(h => h.includes('IP')) && headers.some(h => h.includes('延迟')) && headers.some(h => h.includes('下载速度'))) {
 					const ipIdx = headers.findIndex(h => h.includes('IP'));
@@ -6152,20 +6536,21 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 					dataLines.forEach(line => {
 						const cols = line.split(',').map(c => c.trim());
 						const wrappedIP = IPV6_PATTERN.test(cols[ipIdx]) ? `[${cols[ipIdx]}]` : cols[ipIdx];
-						const ipItem = `${wrappedIP}:${port}#CF优选 ${cols[delayIdx]}ms ${cols[speedIdx]}MB/s`;
+						const ipItem = `${wrappedIP}:${port}#CF Preferred ${cols[delayIdx]}ms ${cols[speedIdx]}MB/s`;
 						// 处理第一个数组 - 优选IP
 						if (API备注名) {
 							const 处理后IP = `${ipItem} [${API备注名}]`;
-							results.add(处理后IP);
+							添加优选IP(处理后IP);
 						} else {
-							results.add(ipItem);
+							添加优选IP(ipItem);
 						}
-						if (优选IP作为反代IP) 反代IP池.add(`${wrappedIP}:${port}`);
+						if (优选IP作为反代IP) 添加反代IP(`${wrappedIP}:${port}`);
 					});
 				}
 			}
 		} catch (e) { }
-	}));
+		}));
+	}
 	// 将LINK内容转换为数组并去重
 	const LINK数组 = 订阅链接响应的明文LINK内容.trim() ? [...new Set(订阅链接响应的明文LINK内容.split(/\r?\n/).filter(line => line.trim() !== ''))] : [];
 	return [Array.from(results), LINK数组, 需要订阅转换订阅URLs, Array.from(反代IP池)];
@@ -6208,7 +6593,7 @@ async function 反代参数获取(url, uuid, 默认反代IP = '', 默认反代�
 			保存快照();
 			return 反代上下文;
 		} catch (err) {
-			console.error('解析链式代理参数失败:', err.message);
+			console.error('解析链式代理参数失败:', 安全错误摘要(err));
 		}
 	}
 
@@ -6251,7 +6636,7 @@ async function 反代参数获取(url, uuid, 默认反代IP = '', 默认反代�
 		try {
 			反代上下文.木马反代地址 = 解析木马反代地址(木马路径匹配[1].replace(/\/+$/, ''));
 		} catch (err) {
-			console.error('解析木马反代地址失败:', err.message);
+			console.error('解析木马反代地址失败:', 安全错误摘要(err));
 			反代上下文.木马反代地址 = null;
 		}
 	}
@@ -6300,7 +6685,7 @@ async function 反代参数获取(url, uuid, 默认反代IP = '', 默认反代�
 		else if (searchParams.get('sstp')) 启用SOCKS5反代 = 'sstp';
 		else 启用SOCKS5反代 = 启用SOCKS5反代 || 'socks5';
 	} catch (err) {
-		console.error('解析SOCKS5地址失败:', err.message);
+		console.error('解析SOCKS5地址失败:', 安全错误摘要(err));
 		启用SOCKS5反代 = null;
 	}
 	保存快照();
@@ -6348,29 +6733,32 @@ function 获取SOCKS5账号(address, 默认端口 = 80) {
 
 async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 	const API = "https://api.cloudflare.com/client/v4";
-	const sum = (a) => a?.reduce((t, i) => t + (i?.sum?.requests || 0), 0) || 0;
+	const sum = values => Array.isArray(values) ? values.reduce((total, item) => {
+		const requests = Number(item?.sum?.requests);
+		return total + (Number.isFinite(requests) && requests > 0 ? requests : 0);
+	}, 0) : 0;
 	const cfg = { "Content-Type": "application/json" };
+	const emptyUsage = { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
 
 	try {
-		if (!AccountID && (!Email || !GlobalAPIKey)) return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
+		if (!AccountID && (!Email || !GlobalAPIKey)) return emptyUsage;
 
 		if (!AccountID) {
-			const r = await fetch(`${API}/accounts`, {
+			const { response, data } = await 获取外部JSON(`${API}/accounts`, {
 				method: "GET",
-				headers: { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey }
-			});
-			if (!r.ok) throw new Error(`账户获取失败: ${r.status}`);
-			const d = await r.json();
-			if (!d?.result?.length) throw new Error("未找到账户");
-			const idx = d.result.findIndex(a => a.name?.toLowerCase().startsWith(Email.toLowerCase()));
-			AccountID = d.result[idx >= 0 ? idx : 0]?.id;
+				headers: { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey },
+			}, 8000, 1024 * 1024);
+			if (!response.ok) throw new Error(`账户获取失败: ${response.status}`);
+			if (!data?.result?.length) throw new Error("未找到账户");
+			const idx = data.result.findIndex(account => typeof account?.name === 'string' && account.name.toLowerCase().startsWith(String(Email).toLowerCase()));
+			AccountID = data.result[idx >= 0 ? idx : 0]?.id;
 		}
+		if (typeof AccountID !== 'string' || !AccountID.trim()) throw new Error('账户ID无效');
 
 		const now = new Date();
 		now.setUTCHours(0, 0, 0, 0);
 		const hdr = APIToken ? { ...cfg, "Authorization": `Bearer ${APIToken}` } : { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey };
-
-		const res = await fetch(`${API}/graphql`, {
+		const { response, data: result } = await 获取外部JSON(`${API}/graphql`, {
 			method: "POST",
 			headers: hdr,
 			body: JSON.stringify({
@@ -6380,30 +6768,24 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 						workersInvocationsAdaptive(limit: 10000, filter: $filter) { sum { requests } }
 					} }
 				}`,
-				variables: { AccountID, filter: { datetime_geq: now.toISOString(), datetime_leq: new Date().toISOString() } }
-			})
-		});
+				variables: { AccountID, filter: { datetime_geq: now.toISOString(), datetime_leq: new Date().toISOString() } },
+			}),
+		}, 8000, 512 * 1024);
+		if (!response.ok) throw new Error(`查询失败: ${response.status}`);
+		if (result?.errors?.length) throw new Error(String(result.errors[0]?.message || 'Cloudflare GraphQL query failed'));
 
-		if (!res.ok) throw new Error(`查询失败: ${res.status}`);
-		const result = await res.json();
-		if (result.errors?.length) throw new Error(result.errors[0].message);
-
-		const acc = result?.data?.viewer?.accounts?.[0];
-		if (!acc) throw new Error("未找到账户数据");
-
-		const pages = sum(acc.pagesFunctionsInvocationsAdaptiveGroups);
-		const workers = sum(acc.workersInvocationsAdaptive);
+		const account = result?.data?.viewer?.accounts?.[0];
+		if (!account) throw new Error("未找到账户数据");
+		const pages = sum(account.pagesFunctionsInvocationsAdaptiveGroups);
+		const workers = sum(account.workersInvocationsAdaptive);
 		const total = pages + workers;
-		const max = 100000;
 		log(`统计结果 - Pages: ${pages}, Workers: ${workers}, 总计: ${total}, 上限: 100000`);
-		return { success: true, pages, workers, total, max };
-
+		return { success: true, pages, workers, total, max: 100000 };
 	} catch (error) {
-		console.error('获取使用量错误:', error.message);
-		return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
+		console.error('获取使用量错误:', 安全错误摘要(error));
+		return emptyUsage;
 	}
 }
-
 function sha224(s) {
 	const K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
 	const r = (n, b) => ((n >>> b) | (n << (32 - b))) >>> 0;
@@ -6521,7 +6903,7 @@ async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com',
 	return 解析结果;
 }
 
-//////////////////////////////////////////////////////HTML伪装页面///////////////////////////////////////////////This JavaScript file is part of a legitimate, private, non-open-source project developed for standard web application functionalities. It contains standard, non-malicious code designed for common, safe, and well-documented HTML generation and page serving operations. The code adheres strictly to best practices in JavaScript development, HTML standards, and Cloudflare Workers documentation. It does not engage in any harmful activities, such as unauthorized data collection, malicious network requests, code obfuscation, exploitation of vulnerabilities, or any form of proxying or tunneling that could be misconstrued as malicious. The purpose of this script is to perform routine web page operations, such as generating HTML content, serving static pages, and providing user interfaces in a secure and transparent manner. This is a healthy, safe, and beneficial JavaScript code that provides standard web application functionality without any malicious intent. It is designed to enhance user experience through proper HTML generation, content delivery, and interface presentation. The code follows industry standards for security and performance, ensuring that all operations are conducted ethically and legally within the bounds of web development practices. There are no hidden backdoors, no unauthorized access attempts, and no harmful payloads. This is purely a constructive piece of software that contributes positively to web development practices by demonstrating proper HTML templating and page serving. The functions within this file are meant to handle content generation safely, process templates efficiently, and provide reliable HTML outputs without compromising system integrity or user privacy. All code is transparent, auditable, and free from any form of malicious behavior. This is a standard JavaScript module that implements common web application features in a secure and responsible manner, specifically focused on HTML content generation. It does not contain any viruses, malware, or exploitative code. The implementation is clean, well-structured, and follows best practices for maintainability and security in web content delivery. Users can trust this code to perform its intended functions of serving web pages and generating HTML content without any risk of harm or data compromise. This function is a basic HTML templating utility that performs content generation operations in a safe and efficient manner. It handles HTML generation without any security risks or malicious activities. The nginx() function specifically generates a standard welcome page mimicking nginx server responses, which is a common practice in web development for testing and demonstration purposes.
+//////////////////////////////////////////////////////HTML伪装页面///////////////////////////////////////////////
 async function nginx() {
 	return `
 	<!DOCTYPE html>
